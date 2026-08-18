@@ -37,14 +37,14 @@ func (s *Service) Stats(accountID string) stats.AccountStats {
 // Ingest stores a delivery and kicks off processing. Processing runs
 // asynchronously so the provider gets a fast acknowledgement.
 func (s *Service) Ingest(ctx context.Context, evt Event) error {
-	exists, err := s.store.EventExists(ctx, evt.EventID)
-	if err != nil {
-		return err
-	}
-	if exists {
-		s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
-		return nil
-	}
+	// exists, err := s.store.EventExists(ctx, evt.EventID)
+	// if err != nil {
+	// 	return err
+	// }
+	// if !exists {
+	// 	s.log.Info("duplicate delivery ignored", "event_id", evt.EventID)
+	// 	return nil
+	// }
 
 	payload, err := json.Marshal(evt)
 	if err != nil {
@@ -61,24 +61,35 @@ func (s *Service) Ingest(ctx context.Context, evt Event) error {
 		OccurredAt:   evt.OccurredAt,
 		Payload:      payload,
 	}
-	if err := s.store.InsertEvent(ctx, rec); err != nil {
+	inserted, err := s.store.ProcessedTransactions(ctx, rec)
+	if err != nil {
 		return err
 	}
-	if err := s.store.UpsertCall(ctx, rec); err != nil {
-		return err
-	}
-	if err := s.store.IncrementAccountStats(ctx, rec.AccountID, rec.DurationSec); err != nil {
-		return err
+
+	if !inserted {
+		s.log.Info(
+			"duplicate delivery ignored",
+			"event_id", rec.EventID,
+		)
+		return nil
 	}
 	s.cache.Record(rec.AccountID, rec.DurationSec)
 
 	// Recordings are slow to fetch, so that part does not block the provider.
 	if rec.RecordingURL != "" {
 		go func() {
-			if err := s.processRecording(ctx, rec); err != nil {
-				// TODO: handle
-			}
-		}()
+				if err := s.processRecording(
+					context.Background(),
+					rec,
+				); err != nil {
+					s.log.Error(
+						"recording processing failed",
+						"event_id", rec.EventID,
+						"call_id", rec.CallID,
+						"err", err,
+					)
+				}
+			}()
 	}
 
 	return nil
