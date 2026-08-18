@@ -76,14 +76,58 @@ func (s *Store) EventExists(ctx context.Context, eventID string) (bool, error) {
 func (s *Store) InsertEvent(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
 		`INSERT INTO events (event_id, call_id, account_id, payload)
-		 VALUES ($1, $2, $3, $4)`,
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (event_id) DO NOTHING
+		RETURNING 1`,
 		e.EventID, e.CallID, e.AccountID, e.Payload)
 	return err
+}
+func (s *Store) InsertEventTx(ctx context.Context, tx pgx.Tx, e Event) (bool, error) {
+var inserted int
+
+	err := tx.QueryRow(ctx, `
+		INSERT INTO events (
+			event_id,
+			call_id,
+			account_id,
+			payload
+		)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (event_id) DO NOTHING
+		RETURNING 1
+	`,
+		e.EventID,
+		e.CallID,
+		e.AccountID,
+		e.Payload,
+	).Scan(&inserted)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // UpsertCall creates or refreshes the call record for this event.
 func (s *Store) UpsertCall(ctx context.Context, e Event) error {
 	_, err := s.pool.Exec(ctx,
+		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, now())
+		 ON CONFLICT (call_id) DO UPDATE SET
+		     status        = EXCLUDED.status,
+		     duration_sec  = EXCLUDED.duration_sec,
+		     recording_url = EXCLUDED.recording_url,
+		     updated_at    = now()`,
+		e.CallID, e.AccountID, e.Status, e.DurationSec, e.RecordingURL)
+	return err
+}
+func (s *Store) UpsertCallTx(ctx context.Context, tx pgx.Tx, e Event) error {
+	_, err := tx.Exec(ctx,
 		`INSERT INTO calls (call_id, account_id, status, duration_sec, recording_url, updated_at)
 		 VALUES ($1, $2, $3, $4, $5, now())
 		 ON CONFLICT (call_id) DO UPDATE SET
@@ -114,6 +158,16 @@ func (s *Store) IncrementAccountStats(ctx context.Context, accountID string, dur
 		accountID, durationSec)
 	return err
 }
+func (s *Store) IncrementAccountStatsTx(ctx context.Context, tx pgx.Tx, accountID string, durationSec int) error {
+	_, err := tx.Exec(ctx,
+		`INSERT INTO account_stats (account_id, call_count, total_duration_sec)
+		 VALUES ($1, 1, $2)
+		 ON CONFLICT (account_id) DO UPDATE SET
+		     call_count         = account_stats.call_count + 1,
+		     total_duration_sec = account_stats.total_duration_sec + EXCLUDED.total_duration_sec`,
+		accountID, durationSec)
+	return err
+}
 
 // AccountStats reads the durable aggregate. A missing account reads as zero.
 func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, error) {
@@ -128,4 +182,40 @@ func (s *Store) AccountStats(ctx context.Context, accountID string) (Stats, erro
 		return Stats{}, err
 	}
 	return st, nil
+}
+// ProcessedTransactions performs the three database operations for a delivery in a single atomic transaction. It returns true if the event was inserted, false if it was a duplicate.
+func (s *Store) ProcessedTransactions(ctx context.Context, rec Event) (bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(ctx)
+
+	inserted, err := s.InsertEventTx(ctx, tx, rec)
+	if err != nil {
+		return false, err
+	}
+
+	if !inserted {
+		return false, nil
+	}
+
+	if err := s.UpsertCallTx(ctx, tx, rec); err != nil {
+		return false, err
+	}
+
+	if err := s.IncrementAccountStatsTx(
+		ctx,
+		tx,
+		rec.AccountID,
+		rec.DurationSec,
+	); err != nil {
+		return false, err
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, err
+	}
+
+	return inserted, nil
 }
