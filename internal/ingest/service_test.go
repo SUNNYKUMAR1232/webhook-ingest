@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"sync"
 
 	"github.com/convin/webhook-ingest/internal/testutil"
 )
@@ -80,5 +81,113 @@ func TestDuplicateDeliveryIsIgnored(t *testing.T) {
 	}
 	if n != 1 {
 		t.Fatalf("stored %d copies of %s, want 1", n, eventID)
+	}
+}
+
+func TestConcurrentDuplicateDeliveryIsIgnored(t *testing.T) {
+	srv, st := testutil.NewServer(t)
+	eventID, callID, accountID := testutil.IDs(t, st)
+	ctx := context.Background()
+
+	body := eventJSON(eventID, callID, accountID)
+
+	const deliveries = 50
+
+	var wg sync.WaitGroup
+	wg.Add(deliveries)
+
+	for i := 0; i < deliveries; i++ {
+		go func(delivery int) {
+			defer wg.Done()
+
+			resp, err := http.Post(
+				srv.URL+"/webhooks/calls",
+				"application/json",
+				strings.NewReader(body),
+			)
+			if err != nil {
+				t.Errorf(
+					"delivery=%d: webhook request failed: %v",
+					delivery,
+					err,
+				)
+				return
+			}
+			defer resp.Body.Close()
+
+			if resp.StatusCode != http.StatusOK {
+				t.Errorf(
+					"delivery=%d: got status=%d, want=%d",
+					delivery,
+					resp.StatusCode,
+					http.StatusOK,
+				)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	// Verify that only one event was persisted.
+	var eventCount int
+
+	err := st.Pool().QueryRow(
+		ctx,
+		`SELECT count(*)
+		 FROM events
+		 WHERE event_id = $1`,
+		eventID,
+	).Scan(&eventCount)
+	if err != nil {
+		t.Fatalf("failed to count events: %v", err)
+	}
+
+	t.Logf(
+		"event persistence result: event_id=%s, deliveries=%d, stored_events=%d",
+		eventID,
+		deliveries,
+		eventCount,
+	)
+
+	if eventCount != 1 {
+		t.Fatalf(
+			"duplicate event records detected: event_id=%s, stored_events=%d, want=1",
+			eventID,
+			eventCount,
+		)
+	}
+
+	// Verify that accounting happened only once.
+	var callCount int64
+
+	err = st.Pool().QueryRow(
+		ctx,
+		`SELECT call_count
+		 FROM account_stats
+		 WHERE account_id = $1`,
+		accountID,
+	).Scan(&callCount)
+	if err != nil {
+		t.Fatalf(
+			"failed to read account stats: account_id=%s, error=%v",
+			accountID,
+			err,
+		)
+	}
+
+	t.Logf(
+		"accounting result: account_id=%s, deliveries=%d, call_count=%d",
+		accountID,
+		deliveries,
+		callCount,
+	)
+
+	if callCount != 1 {
+		t.Fatalf(
+			"call count drift detected: account_id=%s, call_count=%d, want=1, deliveries=%d",
+			accountID,
+			callCount,
+			deliveries,
+		)
 	}
 }
